@@ -104,12 +104,26 @@ def test_domain_trailing_slash_is_stripped(monkeypatch: pytest.MonkeyPatch) -> N
         ("VTEX_COUNTRY", "br"),
         ("VTEX_CURRENCY", "brl"),
         ("VTEX_LOCALE", "ptBR"),
+        ("VTEX_TIMEOUT_SECONDS", "abc"),
+        ("VTEX_TIMEOUT_SECONDS", "0"),
+        ("VTEX_MAX_RETRIES", "99"),
+        ("VTEX_MAX_RETRIES", "-1"),
+        ("VTEX_MAX_RETRIES", "many"),
     ],
 )
 def test_invalid_values_rejected(monkeypatch: pytest.MonkeyPatch, key: str, value: str) -> None:
     set_env(monkeypatch, **{key: value})
     with pytest.raises(VtexConfigError, match=key):
         load_settings()
+
+
+def test_numeric_errors_name_the_variable_once_each(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_env(monkeypatch, VTEX_TIMEOUT_SECONDS="abc", VTEX_MAX_RETRIES="99")
+    with pytest.raises(VtexConfigError) as info:
+        load_settings()
+    message = str(info.value)
+    assert "VTEX_TIMEOUT_SECONDS: " in message
+    assert "VTEX_MAX_RETRIES: " in message
 
 
 def test_env_file_is_used_only_when_given(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

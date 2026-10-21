@@ -19,13 +19,19 @@ Retry policy:
   client stops retrying and raises.
 - `max_retries` counts retries after the first attempt.
 
+Redirects are never followed: a 3xx response raises `VtexRedirectError` with the status and
+the `Location`, which usually means `VTEX_DOMAIN` should name the final host (with or without
+`www`, https instead of http).
+
 Errors carry the method, path, status, and a body excerpt of at most 300 characters; never
 cookies or request headers. Logs hold method, path, status, attempt, and delay only.
 
-Safety: every request refuses attachment and profile endpoints, so the POC never attaches
-customer data to an orderForm (that would create a Master Data record and could trigger
-abandoned-cart e-mails) and never reads a shopper profile. Log lines and error messages
-mask the orderFormId in paths, since the id alone opens the cart.
+Safety: a request goes only to a path on the allowlist below, relative to the store domain:
+Intelligent Search, the orderForm, its items, its `shippingData` attachment, and the orderForms
+simulation. Absolute URLs and every other path are refused, so the POC never attaches customer
+data to an orderForm (that would create a Master Data record and could trigger abandoned-cart
+e-mails) and never reads a shopper profile. Log lines, error messages, and body excerpts mask
+the orderFormId, since the id alone opens the cart.
 """
 
 from __future__ import annotations
@@ -53,14 +59,61 @@ SIMULATION = "/api/checkout/pub/orderForms/simulation"
 
 USER_AGENT = "commerce-agents-vtex-poc/0.1 (+https://github.com/sandhilt/commerce-agents-vtex)"
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
-_FORBIDDEN_PATHS = ("/attachments/", "/api/checkout/pub/profiles")
 _EXCERPT_CHARS = 300
 _ORDER_FORM_ID_IN_PATH = re.compile(r"(/orderForm/)[^/?#]+", re.IGNORECASE)
+_ORDER_FORM_ID_FIELD = re.compile(
+    r"(orderFormId[\\\"']*\s*[:=]\s*[\\\"']*)[A-Za-z0-9]+", re.IGNORECASE
+)
+_MIN_LITERAL_ID_CHARS = 8
+
+_SEGMENT = r"[A-Za-z0-9_.~-]+"
+_ID = r"[A-Za-z0-9]+"
+_ALLOWED_PATHS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        rf"{IS_PRODUCT_SEARCH}(?:/{_SEGMENT})*",
+        rf"{IS_PRODUCTS}(?:/{_SEGMENT})*",
+        ORDER_FORM,
+        rf"{ORDER_FORM}/{_ID}",
+        rf"{ORDER_FORM}/{_ID}/items",
+        rf"{ORDER_FORM}/{_ID}/items/update",
+        rf"{ORDER_FORM}/{_ID}/attachments/shippingData",
+        SIMULATION,
+    )
+)
 
 
-def _mask(path: str) -> str:
-    """The path with any orderFormId replaced, for logs and error messages."""
-    return _ORDER_FORM_ID_IN_PATH.sub(r"\1<orderFormId>", path)
+def _mask(text: str) -> str:
+    """The text with any orderFormId replaced, for logs and error messages."""
+    text = _ORDER_FORM_ID_IN_PATH.sub(r"\1<orderFormId>", text)
+    return _ORDER_FORM_ID_FIELD.sub(r"\1<orderFormId>", text)
+
+
+def _mask_body(text: str, path: str) -> str:
+    """A response body with the orderFormId of the requested path and any id field replaced."""
+    for match in _ORDER_FORM_ID_IN_PATH.finditer(path):
+        order_form_id = match.group(0).split("/")[-1]
+        if len(order_form_id) >= _MIN_LITERAL_ID_CHARS:
+            text = text.replace(order_form_id, "<orderFormId>")
+    return _mask(text)
+
+
+def _check_path(path: str) -> None:
+    """Refuse anything but a relative path on the allowlist."""
+    segments = path.split("/")
+    if (
+        not path.startswith("/")
+        or path.startswith("//")
+        or "\\" in path
+        or "." in segments
+        or ".." in segments
+        or not any(pattern.fullmatch(path) for pattern in _ALLOWED_PATHS)
+    ):
+        raise ValueError(
+            f"Path is not allowed: {_mask(path)!r}. The POC calls only catalog, orderForm, "
+            "items, shippingData, and simulation paths on the store domain, and never sends "
+            "or reads customer data"
+        )
 
 
 class _MaskOrderFormIds(logging.Filter):
@@ -90,8 +143,21 @@ class VtexHTTPError(VtexError):
         self.status_code = status_code
         self.method = method
         self.path = path
-        self.body_excerpt = body_excerpt[:_EXCERPT_CHARS]
+        self.body_excerpt = _mask(body_excerpt)[:_EXCERPT_CHARS]
         super().__init__(f"{method} {path} returned {status_code}: {self.body_excerpt}")
+
+
+class VtexRedirectError(VtexHTTPError):
+    """A 3xx response. Redirects are not followed; the store domain probably needs changing."""
+
+    def __init__(self, status_code: int, method: str, path: str, location: str) -> None:
+        super().__init__(status_code, method, path, "")
+        self.location = _mask(location)[:_EXCERPT_CHARS]
+        self.args = (
+            f"{method} {path} was redirected ({status_code}) to {self.location or '(no Location)'}; "
+            "redirects are not followed. Set VTEX_DOMAIN to the host in Location "
+            "(for example with or without www) so requests reach it directly",
+        )
 
 
 class VtexNetworkError(VtexError):
@@ -216,9 +282,7 @@ class VtexClient:
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> Any:
-        lowered = path.lower()
-        if any(part in lowered for part in _FORBIDDEN_PATHS):
-            raise ValueError("The POC never sends or reads customer data on an orderForm")
+        _check_path(path)
         shown = _mask(path)
         attempts = self.settings.max_retries + 1
         for attempt in range(attempts):
@@ -250,7 +314,14 @@ class VtexClient:
             if response.is_success:
                 return self._decode(response, method, shown)
 
-            error = VtexHTTPError(response.status_code, method, shown, response.text)
+            if response.is_redirect or 300 <= response.status_code < 400:
+                raise VtexRedirectError(
+                    response.status_code, method, shown, response.headers.get("Location", "")
+                )
+
+            error = VtexHTTPError(
+                response.status_code, method, shown, _mask_body(response.text, path)
+            )
             if last or not safe or response.status_code not in RETRYABLE_STATUSES:
                 raise error
             retry_after = _parse_retry_after(response.headers.get("Retry-After"))

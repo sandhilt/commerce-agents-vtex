@@ -136,5 +136,6 @@ def load_settings(env_file: str | Path | None = None) -> VtexSettings:
             if err["type"] == "missing":
                 problems.append(f"{name} is required")
             else:
-                problems.append(err["msg"].removeprefix("Value error, ") or name)
+                message = err["msg"].removeprefix("Value error, ")
+                problems.append(message if name in message else f"{name}: {message}")
         raise VtexConfigError("Invalid VTEX configuration: " + "; ".join(problems)) from None
